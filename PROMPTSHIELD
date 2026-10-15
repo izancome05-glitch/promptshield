@@ -1,0 +1,1787 @@
+// ==UserScript==
+// @name         PromptShield
+// @namespace    https://promptshield.local/
+// @version      3.0.0
+// @description  Cortafuegos de privacidad para IAs (datos sensibles -> marcadores reversibles en local) + 8 herramientas de un clic cuyo texto también pasa por la protección.
+// @author       IzanHermoso
+// @copyright    IzanHermoso
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @match        https://claude.ai/*
+// @match        https://gemini.google.com/*
+// @run-at       document-idle
+// @noframes
+// @grant        none
+// ==/UserScript==
+
+/*
+ * PromptShield 3.0.0 · Creado por IzanHermoso
+ * ------------------------------------------------------------------
+ * Flujo:  tu texto -> detección local -> marcadores [IBAN_1_X7Q] -> IA
+ *         respuesta de la IA -> marcadores restaurados SOLO en tu pantalla
+ *
+ * Novedades 3.0.0: rediseño completo de la interfaz (sistema "Tinta y latón"), iconos SVG propios,
+ *  controles segmentados, selector de herramientas con categorías y distintivo de autoría.
+ *
+ * Novedades 2.2.0: reglas de protección (tipos, IP, palabras propias), vista previa del texto
+ *  protegido, atajos de teclado y 16 herramientas.
+ *
+ * Novedades 2.0.0:
+ *  - Menú "Herramientas" con 8 funciones de un clic. Cada una escribe un prompt
+ *    en el editor y lo envía PASANDO por la detección de datos sensibles.
+ *  - Accesibilidad: la píldora responde a Enter/Espacio, el panel se cierra al
+ *    pulsar fuera, los diálogos atrapan el foco con Tab y aíslan el teclado de la página.
+ *
+ * Principios:
+ *  - Todo ocurre en tu navegador. Sin red, sin telemetría, sin eval.
+ *  - Fallo seguro: si algo falla, el envío se BLOQUEA y se te avisa.
+ *  - El mapa marcador<->dato real vive solo en memoria (closure privada);
+ *    no se guarda en localStorage porque los scripts de la página podrían leerlo.
+ *    Las herramientas tampoco guardan nada (ni siquiera el diario).
+ */
+
+(function () {
+  'use strict';
+
+  if (document.getElementById('promptshield-host')) return; // evita doble inyección
+
+  /* ===== CORE:START ===== (lógica pura, sin DOM: se puede testear en Node) */
+  const Core = (() => {
+    const MAX_LEN = 1_000_000; // por encima, se rechaza (fallo seguro)
+    const MAX_MATCHES = 2000;
+
+    const DNI_LETTERS = 'TRWAGMYFPDXBNJZSQVHLCKE';
+
+    // Longitud oficial del IBAN por país (los países no listados no se detectan).
+    const IBAN_LENGTHS = {
+      AD: 24, AT: 20, BE: 16, BG: 22, CH: 21, CY: 28, CZ: 24, DE: 22, DK: 18,
+      EE: 20, ES: 24, FI: 18, FR: 27, GB: 22, GI: 23, GR: 27, HR: 21, HU: 28,
+      IE: 22, IS: 26, IT: 27, LI: 21, LT: 20, LU: 20, LV: 21, MC: 27, MT: 31,
+      NL: 18, NO: 15, PL: 28, PT: 25, RO: 24, SE: 24, SI: 19, SK: 24, SM: 27,
+    };
+
+    const TYPE_LABEL = {
+      SECRETO: 'Clave / secreto',
+      IBAN: 'IBAN',
+      TARJETA: 'Tarjeta bancaria',
+      DNI: 'DNI',
+      NIE: 'NIE',
+      EMAIL: 'Email',
+      TELEFONO: 'Teléfono',
+      IP: 'Dirección IP',
+      PERSONALIZADO: 'Palabra propia',
+    };
+
+    // En solapes gana el tipo de menor número (lo más crítico primero).
+    const PRIORITY = { SECRETO: 0, IBAN: 1, TARJETA: 2, DNI: 3, NIE: 3, EMAIL: 4, PERSONALIZADO: 4, TELEFONO: 5, IP: 6 };
+
+    // Formato del marcador: [TIPO_n_ABC]. "ABC" es una etiqueta aleatoria de sesión:
+    // evita restaurar mal marcadores antiguos tras recargar la página.
+    const PLACEHOLDER_SRC = '\\[[A-Z]+_\\d+_[A-Z0-9]{3}\\]';
+    const PLACEHOLDER_FULL = new RegExp('^' + PLACEHOLDER_SRC + '$');
+    const PLACEHOLDER_ANY = new RegExp(PLACEHOLDER_SRC);
+
+    /* ---------- Validadores matemáticos ---------- */
+
+    function isValidDni(s) {
+      const m = /^(\d{8})[- ]?([A-Za-z])$/.exec(s);
+      return !!m && DNI_LETTERS[Number(m[1]) % 23] === m[2].toUpperCase();
+    }
+
+    function isValidNie(s) {
+      const m = /^([XYZxyz])[- ]?(\d{7})[- ]?([A-Za-z])$/.exec(s);
+      if (!m) return false;
+      const n = Number(String('XYZ'.indexOf(m[1].toUpperCase())) + m[2]);
+      return DNI_LETTERS[n % 23] === m[3].toUpperCase();
+    }
+
+    function luhn(digits) {
+      let sum = 0;
+      let alt = false;
+      for (let i = digits.length - 1; i >= 0; i--) {
+        let d = digits.charCodeAt(i) - 48;
+        if (d < 0 || d > 9) return false;
+        if (alt) {
+          d *= 2;
+          if (d > 9) d -= 9;
+        }
+        sum += d;
+        alt = !alt;
+      }
+      return digits.length > 0 && sum % 10 === 0;
+    }
+
+    function isValidCard(raw) {
+      const d = raw.replace(/\D/g, '');
+      return d.length >= 13 && d.length <= 19 && !/^(\d)\1+$/.test(d) && luhn(d);
+    }
+
+    // ISO 13616: se mueven los 4 primeros caracteres al final y se calcula mod 97 por trozos.
+    function ibanMod97(iban) {
+      const s = iban.slice(4) + iban.slice(0, 4);
+      let rem = 0;
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c >= 48 && c <= 57) rem = (rem * 10 + (c - 48)) % 97;
+        else if (c >= 65 && c <= 90) rem = (rem * 100 + (c - 55)) % 97;
+        else return false;
+      }
+      return rem === 1;
+    }
+
+    function phoneDigits(v) {
+      return v.replace(/\D/g, '');
+    }
+    function isValidEsPhone(v) {
+      let d = phoneDigits(v);
+      if (v.startsWith('00')) d = d.slice(4);
+      else if (v.startsWith('+34')) d = d.slice(2);
+      return d.length === 9;
+    }
+    function isValidIntlPhone(v) {
+      const n = phoneDigits(v).length;
+      return n >= 8 && n <= 15;
+    }
+
+    /* ---------- Patrones ---------- */
+
+    const SECRET_PATTERNS = [
+      /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/g, // OpenAI / Anthropic
+      /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g, // GitHub
+      /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
+      /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, // AWS
+      /\bAIza[0-9A-Za-z_-]{35}\b/g, // Google API
+      /\bxox[abprs]-[A-Za-z0-9-]{10,}/g, // Slack
+      /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g, // Stripe
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, // JWT
+      /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    ];
+    const BEARER_RE = /\bBearer\s+([A-Za-z0-9._~+/-]{16,}=*)/g;
+    // "password: xxx", "api_key=xxx"… solo se sustituye el VALOR (grupo 1).
+    const ASSIGN_RE =
+      /\b(?:password|passwd|pwd|contraseña|secret|token|api[_-]?key|apikey|access[_-]?key)\s*[:=]\s*["']?([^\s"'`]{6,})/gi;
+
+    const DNI_RE = /(?<![A-Za-z0-9])\d{8}[- ]?[A-Za-z](?![A-Za-z0-9])/g;
+    const NIE_RE = /(?<![A-Za-z0-9])[XYZxyz][- ]?\d{7}[- ]?[A-Za-z](?![A-Za-z0-9])/g;
+    const EMAIL_RE =
+      /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![A-Za-z0-9-])/g;
+    const CARD_RE = /(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)/g;
+    const PHONE_ES_RE =
+      /(?<![\w+])(?:(?:\+|00)34[ .-]?)?[6789]\d{2}(?:[ .-]?\d{3}[ .-]?\d{3}|[ .-]?\d{2}[ .-]?\d{2}[ .-]?\d{2})(?![\w])/g;
+    const PHONE_INTL_RE = /(?<![\w+])\+(?!34)\d{1,3}(?:[ .-]?\d{2,4}){2,4}(?![\w])/g;
+    const IBAN_START_RE = /(?<![A-Za-z0-9])[A-Za-z]{2}\d{2}(?=[ ]?[A-Za-z0-9])/g;
+
+    /* ---------- Escáneres ---------- */
+
+    function scan(text, re, type, opts) {
+      const group = (opts && opts.group) || 0;
+      const validate = opts && opts.validate;
+      const out = [];
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (m[0].length === 0) {
+          re.lastIndex++;
+          continue;
+        }
+        const value = m[group];
+        if (value === undefined) continue;
+        // El grupo capturado siempre está al final del match en nuestros patrones.
+        const start = group ? m.index + m[0].length - value.length : m.index;
+        if (!validate || validate(value)) {
+          out.push({ type, start, end: start + value.length, value });
+        }
+      }
+      return out;
+    }
+
+    const isAlnum = (ch) => ch !== undefined && /[A-Za-z0-9]/.test(ch);
+
+    // El IBAN puede venir con espacios: se consume exactamente la longitud del país.
+    function scanIbans(text) {
+      const out = [];
+      IBAN_START_RE.lastIndex = 0;
+      let m;
+      while ((m = IBAN_START_RE.exec(text)) !== null) {
+        const start = m.index;
+        const len = IBAN_LENGTHS[m[0].slice(0, 2).toUpperCase()];
+        if (!len) continue;
+        let i = start;
+        let count = 0;
+        let compact = '';
+        while (i < text.length && count < len) {
+          const ch = text[i];
+          if (isAlnum(ch)) {
+            compact += ch.toUpperCase();
+            count++;
+            i++;
+          } else if ((ch === ' ' || ch === '\u00a0') && count > 0 && isAlnum(text[i + 1])) {
+            i++;
+          } else break;
+        }
+        if (count !== len || isAlnum(text[i]) || !ibanMod97(compact)) continue;
+        out.push({ type: 'IBAN', start, end: i, value: text.slice(start, i) });
+        IBAN_START_RE.lastIndex = i;
+      }
+      return out;
+    }
+
+    const IP_RE = /(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\w]|\.\d)/g;
+    const isUsableIp = (v) => !['0.0.0.0', '127.0.0.1', '255.255.255.255'].includes(v);
+
+    // Palabras propias (nombres, empresas, proyectos...). Solo viven en memoria.
+    let customRe = null;
+    function setCustomTerms(list) {
+      try {
+        const terms = Array.from(new Set((list || []).map((t) => String(t).trim()).filter((t) => t.length >= 2)))
+          .sort((a, b) => b.length - a.length)
+          .slice(0, 200);
+        customRe = terms.length
+          ? new RegExp(
+              '(?<![\\p{L}\\p{N}])(?:' + terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?![\\p{L}\\p{N}])',
+              'giu'
+            )
+          : null;
+      } catch (_) {
+        customRe = null;
+      }
+    }
+
+    // Tipos que el usuario ha desactivado (los secretos no se pueden desactivar).
+    let disabled = new Set();
+    function setDisabled(types) {
+      disabled = new Set((types || []).filter((t) => t !== 'SECRETO'));
+    }
+
+    /** Devuelve los datos sensibles de `text`, sin solapes y ordenados por posición. */
+    function detect(text) {
+      if (typeof text !== 'string') throw new TypeError('PromptShield: se esperaba texto');
+      if (text.length > MAX_LEN) throw new RangeError('El mensaje es demasiado largo para analizarlo con seguridad.');
+
+      const c = [];
+      for (const re of SECRET_PATTERNS) c.push(...scan(text, re, 'SECRETO'));
+      c.push(...scan(text, BEARER_RE, 'SECRETO', { group: 1 }));
+      c.push(...scan(text, ASSIGN_RE, 'SECRETO', { group: 1 }));
+      c.push(...scanIbans(text));
+      c.push(...scan(text, CARD_RE, 'TARJETA', { validate: isValidCard }));
+      c.push(...scan(text, DNI_RE, 'DNI', { validate: isValidDni }));
+      c.push(...scan(text, NIE_RE, 'NIE', { validate: isValidNie }));
+      c.push(...scan(text, EMAIL_RE, 'EMAIL'));
+      c.push(...scan(text, PHONE_ES_RE, 'TELEFONO', { validate: isValidEsPhone }));
+      c.push(...scan(text, PHONE_INTL_RE, 'TELEFONO', { validate: isValidIntlPhone }));
+      c.push(...scan(text, IP_RE, 'IP', { validate: isUsableIp }));
+      if (customRe) c.push(...scan(text, customRe, 'PERSONALIZADO'));
+
+      if (c.length > MAX_MATCHES * 4) throw new RangeError('Demasiados datos sensibles para procesarlos con seguridad.');
+
+      c.sort(
+        (a, b) =>
+          PRIORITY[a.type] - PRIORITY[b.type] ||
+          b.end - b.start - (a.end - a.start) ||
+          a.start - b.start
+      );
+      const accepted = [];
+      for (const x of c) {
+        if (disabled.has(x.type) || PLACEHOLDER_FULL.test(x.value)) continue; // desactivado o ya es un marcador
+        if (!accepted.some((a) => x.start < a.end && a.start < x.end)) accepted.push(x);
+        if (accepted.length > MAX_MATCHES) throw new RangeError('Demasiados datos sensibles para procesarlos con seguridad.');
+      }
+      return accepted.sort((a, b) => a.start - b.start);
+    }
+
+    /* ---------- Vault: mapa marcador <-> dato real ---------- */
+
+    class Vault {
+      constructor(tag) {
+        this.tag = tag || Vault.randomTag();
+        this.byValue = new Map();
+        this.byPlaceholder = new Map();
+        this.counters = Object.create(null);
+      }
+      static randomTag() {
+        const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        const b = new Uint8Array(3);
+        crypto.getRandomValues(b);
+        return Array.from(b, (x) => A[x % A.length]).join('');
+      }
+      /** Mismo dato -> mismo marcador (la IA mantiene la coherencia). */
+      assign(type, value) {
+        const key = type + '\u0000' + value;
+        let ph = this.byValue.get(key);
+        if (ph) return ph;
+        const n = (this.counters[type] || 0) + 1;
+        this.counters[type] = n;
+        ph = '[' + type + '_' + n + '_' + this.tag + ']';
+        this.byValue.set(key, ph);
+        this.byPlaceholder.set(ph, value);
+        return ph;
+      }
+      lookup(ph) {
+        return this.byPlaceholder.get(ph);
+      }
+      get size() {
+        return this.byPlaceholder.size;
+      }
+      clear() {
+        this.byValue.clear();
+        this.byPlaceholder.clear();
+        this.counters = Object.create(null);
+      }
+    }
+
+    function restore(text, vault) {
+      if (text.indexOf('[') === -1) return text;
+      return text.replace(new RegExp(PLACEHOLDER_SRC, 'g'), (m) => {
+        const v = vault.lookup(m);
+        return v === undefined ? m : v; // marcadores desconocidos se dejan intactos
+      });
+    }
+
+    // Si un hallazgo "envuelve" marcadores ya puestos (p. ej. tras sustituir a un vecino),
+    // se guarda su valor ORIGINAL expandido para que restaurar devuelva siempre el texto real.
+    function assignExpanded(vault, f) {
+      return vault.assign(f.type, restore(f.value, vault));
+    }
+
+    // Repite pasadas hasta que no queda nada: sustituir un dato puede dejar al descubierto
+    // otro que antes no se reconocía por estar pegado a él (p. ej. "a@x.com4111…").
+    function pseudonymize(text, vault) {
+      let current = text;
+      const all = [];
+      for (let pass = 0; pass < 5; pass++) {
+        const findings = detect(current);
+        if (!findings.length) return { text: current, findings: all };
+        let out = '';
+        let pos = 0;
+        for (const f of findings) {
+          out += current.slice(pos, f.start) + assignExpanded(vault, f);
+          pos = f.end;
+        }
+        out += current.slice(pos);
+        current = out;
+        all.push(...findings);
+      }
+      // No convergió: fallo seguro (el llamador bloquea el envío).
+      throw new Error('No se pudo proteger por completo el texto.');
+    }
+
+    function maskValue(value) {
+      const v = value.replace(/\s+/g, ' ');
+      if (v.length <= 4) return '••••';
+      return v.slice(0, 2) + '•'.repeat(Math.min(v.length - 4, 8)) + v.slice(-2);
+    }
+
+    return {
+      detect, pseudonymize, restore, maskValue, assignExpanded, Vault, setCustomTerms, setDisabled,
+      isValidDni, isValidNie, isValidCard, ibanMod97, luhn,
+      hasPlaceholder: (t) => PLACEHOLDER_ANY.test(t),
+      PLACEHOLDER_SRC, TYPE_LABEL,
+    };
+  })();
+  /* ===== CORE:END ===== */
+
+  /* ===== TOOLS:START ===== (datos puros: prompts de las 8 herramientas) */
+  const SUFFIX =
+    'Nota: los marcadores entre corchetes como [TIPO_n_ABC] son datos protegidos; cópialos tal cual y no intentes adivinar su contenido.';
+
+  const QUESTIONS = [
+    '1) ¿Cómo es tu plan perfecto para un sábado?',
+    '2) ¿Qué es lo que más te estresa?',
+    '3) ¿Qué te hace más ilusión ahora mismo?',
+    '4) ¿Cómo manejas un desacuerdo?',
+    '5) ¿Qué es lo que más valoras en una persona cercana?',
+  ].join('\n');
+
+  const TOOLS = [
+    {
+      id: 'indirectas', icon: '🕵️', name: 'Traductor de Indirectas',
+      desc: 'Qué quiere decir realmente ese «ya hablamos…».',
+      fields: [
+        { label: 'Mensaje recibido', ph: 'Pega aquí el mensaje', req: true },
+        { label: 'Contexto (opcional)', ph: 'Quién es, qué pasó antes…', rows: 3 },
+      ],
+      prompt:
+        'Actúa como un intérprete de comunicación humana. Analiza el mensaje que he recibido y dime qué probablemente quiere decir realmente la otra persona. ' +
+        'Estructura: 1) Lectura literal; 2) Lectura más probable, con un nivel de confianza en %; 3) Otras lecturas posibles; ' +
+        '4) Dos posibles respuestas mías, una neutra y otra más cercana. ' +
+        'No diagnostiques a nadie ni supongas mala intención sin indicios; si falta contexto, dilo.',
+    },
+    {
+      id: 'cerebros', icon: '🧠', name: 'Compatibilidad de Cerebros',
+      desc: 'Dos personas, 5 preguntas: en qué coincidís y en qué chocáis.',
+      intro: 'Cada persona responde estas 5 preguntas y las pegáis aquí:\n' + QUESTIONS,
+      fields: [
+        { label: 'Persona A (nombre y respuestas)', ph: 'Ana: 1) … 2) … 3) … 4) … 5) …', req: true, rows: 5 },
+        { label: 'Persona B (nombre y respuestas)', ph: 'Luis: 1) … 2) … 3) … 4) … 5) …', req: true, rows: 5 },
+      ],
+      prompt:
+        'Dos personas han respondido a las mismas 5 preguntas:\n' + QUESTIONS + '\n' +
+        'Compara sus respuestas y devuelve: 1) Una puntuación de compatibilidad de 0 a 100 con una frase que la justifique; ' +
+        '2) En qué piensan igual; 3) En qué chocan; 4) Una pregunta para charlar juntos; 5) Un título divertido para este dúo. ' +
+        'Tono cálido y con humor, sin juicios definitivos: es un juego, no un diagnóstico.',
+    },
+    {
+      id: 'zombis', icon: '🧟', name: 'Suscripciones Zombis',
+      desc: 'Detecta cobros recurrentes que quizá ya no usas.',
+      fields: [
+        { label: 'Extracto bancario (varios meses)', ph: 'Pega aquí los movimientos. IBAN y tarjetas se protegerán antes de enviar.', req: true, rows: 8 },
+      ],
+      prompt:
+        'Analiza este extracto bancario y detecta suscripciones y cobros recurrentes que probablemente ya no uso. ' +
+        'Devuelve una tabla con: comercio, importe, frecuencia estimada, meses en los que aparece y probabilidad de que sea una suscripción olvidada (alta, media o baja). ' +
+        'Después indica el total mensual y anual de los candidatos y qué cancelaría primero. ' +
+        'Marca las dudas en lugar de inventar y no des asesoramiento financiero.',
+    },
+    {
+      id: 'negociador', icon: '📞', name: 'Negociador de Facturas',
+      desc: 'Guion de llamada para pedir una rebaja.',
+      fields: [
+        { label: 'Servicio, importe y condiciones', ph: 'Fibra + móvil, 62 €/mes, permanencia hasta marzo…', req: true, rows: 4 },
+        { label: 'Qué te gustaría conseguir (opcional)', ph: 'Bajar a 45 €/mes, quitar la permanencia…', rows: 2 },
+      ],
+      prompt:
+        'Actúa como un negociador experto en atención al cliente. Con los datos de mi factura o contrato, prepárame el guion de una llamada para pedir una rebaja: ' +
+        '1) Qué debo comprobar o tener a mano antes de llamar; 2) Frase de apertura; 3) Tres argumentos concretos (permanencia, competencia, historial como cliente); ' +
+        '4) Respuestas a las objeciones más típicas; 5) Mi plan B si dicen que no (portabilidad, reclamación). ' +
+        'Tono firme y educado. No inventes ofertas concretas de la competencia: dime qué debo buscar.',
+    },
+    {
+      id: 'grupos', icon: '🍻', name: 'Plan para Grupos Indecisos',
+      desc: 'El plan que mejor encaja con todos.',
+      fields: [
+        { label: 'Tipo de plan, zona, fecha y presupuesto', ph: 'Cena el viernes en Madrid centro, unos 25 € por persona', req: true, rows: 2 },
+        { label: 'Preferencias de cada persona (una por línea)', ph: 'Ana: vegetariana, no le gusta el ruido\nLuis: cualquier cosa menos italiano', req: true, rows: 5 },
+      ],
+      prompt:
+        'Somos un grupo y no nos ponemos de acuerdo. Con las preferencias de cada persona, propón el plan que mejor encaje con todos: ' +
+        '1) Plan recomendado y por qué encaja; 2) Cómo satisface a cada persona (puntuación de 1 a 5); 3) Una alternativa por si no gusta; ' +
+        '4) Un mensaje corto para el grupo de WhatsApp para cerrarlo. ' +
+        'No inventes locales ni horarios que no puedas verificar: sugiere tipos de sitio y qué comprobar.',
+    },
+    {
+      id: 'errores', icon: '🐞', name: 'Traductor de Errores',
+      desc: 'Un error críptico explicado en lenguaje humano.',
+      fields: [
+        { label: 'Error o traza', ph: 'Pega aquí el mensaje de error. Las claves y tokens se protegerán.', req: true, rows: 7 },
+        { label: 'Contexto (opcional)', ph: 'Lenguaje, sistema, qué estabas haciendo…', rows: 2 },
+      ],
+      prompt:
+        'Actúa como un ingeniero senior. Traduce este error a lenguaje humano: 1) Qué significa, en una frase; ' +
+        '2) Causa más probable y dos alternativas, ordenadas por probabilidad; 3) Primer arreglo a probar, con el comando o cambio concreto; ' +
+        '4) Cómo comprobar que quedó resuelto; 5) Qué información extra necesitarías si no funciona. ' +
+        'Si falta contexto (versión, sistema, código), pídelo en lugar de suponerlo.',
+    },
+    {
+      id: 'tutor', icon: '🎓', name: 'Tutor Socrático / Profesor Enfadado',
+      desc: 'Aprende con preguntas o explicando a un profesor exigente.',
+      modes: [
+        {
+          label: 'Tutor Socrático',
+          fields: [{ label: 'Tema que quieres aprender', ph: 'Probabilidad condicionada, el pretérito indefinido…', req: true, rows: 2 }],
+          prompt:
+            'Actúa como un tutor socrático. No me des la respuesta: hazme UNA sola pregunta cada vez que desbloquee el siguiente paso, adaptada a lo que ya sé. ' +
+            'Empieza preguntándome qué entiendo hasta ahora del tema. Si me atasco dos veces seguidas, dame una pista pequeña, nunca la solución completa.',
+        },
+        {
+          label: 'Profesor Enfadado',
+          fields: [{ label: 'Tema que vas a explicar', ph: 'Cómo funciona la inflación…', req: true, rows: 2 }],
+          prompt:
+            'Actúa como un profesor exigente, con humor y sin humillar. Voy a explicarte un tema como si lo enseñara. ' +
+            'Interrúmpeme cuando algo sea impreciso, incompleto o contradictorio, con una objeción por turno. ' +
+            'Al terminar, puntúa mi explicación de 0 a 10 y dime los tres huecos principales. ' +
+            'Ahora confirma el tema en una frase y espera mi explicación.',
+        },
+      ],
+    },
+    {
+      id: 'habitos', icon: '🌱', name: 'Reto Diminuto / Diario de Una Línea',
+      desc: 'Un hábito mínimo al día o patrones de ánimo de tu semana.',
+      modes: [
+        {
+          label: 'Reto Diminuto',
+          fields: [{ label: 'Cómo estás hoy (opcional)', ph: 'Poca energía, 10 minutos libres…', rows: 2 }],
+          prompt:
+            'Dame un reto diminuto para hoy que se pueda hacer en menos de 5 minutos, adaptado a mi energía y a mi situación. ' +
+            'Devuelve: el reto en una frase, por qué ayuda y una versión aún más pequeña por si hoy voy justo. Sin sermones y sin objetivos de peso o dieta.',
+        },
+        {
+          label: 'Diario de Una Línea',
+          fields: [{ label: 'Tus entradas (fecha + una frase por línea)', ph: 'Lun: reunión larga, cansado pero orgulloso\nMar: …', req: true, rows: 7 }],
+          prompt:
+            'Estas son mis entradas de diario de una línea. Detecta patrones de ánimo de la semana: días mejores y peores, temas que se repiten y qué parece coincidir con los buenos días. ' +
+            'Responde de forma orientativa y cálida: no eres terapeuta y no debes diagnosticar. Si ves señales preocupantes, sugiere hablar con alguien de confianza o con un profesional. ' +
+            'Termina con una pregunta para reflexionar.',
+        },
+      ],
+    },
+    {
+      id: 'tono', icon: '🚦', name: 'Detector de Tono',
+      desc: 'Semáforo de tu mensaje antes de enviarlo, con versión limada.',
+      fields: [
+        { label: 'Tu mensaje', ph: 'Pega el mensaje que vas a enviar', req: true, rows: 5 },
+        { label: 'A quién se lo envías (opcional)', ph: 'Mi jefe, mi pareja, un cliente…', rows: 2 },
+      ],
+      prompt:
+        'Analiza el tono del mensaje que voy a enviar. Devuelve: 1) Un semáforo (verde, ámbar o rojo) con una frase de motivo; ' +
+        '2) Las frases concretas que podrían sonar pasivo-agresivas, frías o ambiguas y por qué; 3) Una versión limada que conserve mi mensaje y mi intención; ' +
+        '4) Una versión más directa pero respetuosa. No juzgues mi intención: céntrate en cómo puede leerse.',
+    },
+    {
+      id: 'jefe', icon: '👔', name: 'Traductor Jefe-Humano',
+      desc: 'Qué quiere, qué le preocupa y cómo responder sin fricción.',
+      fields: [
+        { label: 'Correo o mensaje de tu jefe', ph: 'Pega aquí el texto', req: true, rows: 6 },
+        { label: 'Contexto (opcional)', ph: 'Proyecto, plazos, historial con esa persona…', rows: 2 },
+      ],
+      prompt:
+        'Traduce este mensaje de mi jefe: 1) Qué quiere realmente que haga; 2) Qué le preocupa o qué presión puede tener; 3) Qué es urgente y qué puede esperar; ' +
+        '4) Una respuesta breve y profesional que evite fricción; 5) Qué conviene aclarar. ' +
+        'Si el mensaje es ambiguo, di qué interpretaciones caben en lugar de elegir una sin base.',
+    },
+    {
+      id: 'rechazo', icon: '🙅', name: 'Rechazo Elegante',
+      desc: 'Un «no» amable y sin culpa en tres intensidades.',
+      fields: [
+        { label: 'Invitación o petición', ph: 'Me piden que…', req: true, rows: 3 },
+        { label: 'Relación y motivo (opcional)', ph: 'Compañero de trabajo; no tengo tiempo', rows: 2 },
+      ],
+      prompt:
+        'Redacta un rechazo para esta invitación o petición en tres intensidades: 1) Suave, con alternativa; 2) Firme y cordial; 3) Muy breve y sin explicaciones. ' +
+        'Sin culpa, sin excusas inventadas y sin mentiras; si doy un motivo, úsalo tal cual. Añade una frase por si insisten.',
+    },
+    {
+      id: 'diablo', icon: '😈', name: 'Abogado del Diablo / Pre-Mortem',
+      desc: 'Ataca los puntos débiles de tu plan o imagina por qué fracasó.',
+      modes: [
+        {
+          label: 'Abogado del Diablo',
+          fields: [{ label: 'Tu plan o decisión', ph: 'Voy a dejar mi trabajo para…', req: true, rows: 5 }],
+          prompt:
+            'Actúa como abogado del diablo constructivo. Ataca los tres puntos más débiles de mi plan: para cada uno explica el riesgo, qué evidencia lo apoyaría y cómo podría reforzarlo. ' +
+            'Termina con la pregunta más incómoda que debería responder antes de decidir. Sin ser destructivo.',
+        },
+        {
+          label: 'Pre-Mortem',
+          fields: [{ label: 'Tu plan o proyecto', ph: 'Lanzaré una tienda online en enero…', req: true, rows: 5 }],
+          prompt:
+            'Imagina que este plan fracasó dentro de un año. Dame las 5 causas más probables ordenadas por probabilidad e impacto, una señal temprana para detectar cada una y una acción preventiva concreta. ' +
+            'Termina diciendo cuál me conviene vigilar primero.',
+        },
+      ],
+    },
+    {
+      id: 'contrato', icon: '📑', name: 'Preguntas que Deberías Hacer',
+      desc: 'Contrato, oferta o presupuesto: las 5 preguntas incómodas.',
+      fields: [
+        { label: 'Texto del contrato, oferta o presupuesto', ph: 'Pega aquí el texto. DNI, IBAN y teléfonos se protegerán.', req: true, rows: 8 },
+      ],
+      prompt:
+        'Lee este documento y devuélveme las 5 preguntas incómodas que nadie suele hacer antes de firmar o aceptar: para cada una indica la cláusula o dato que la motiva, por qué importa y qué respuesta sería una señal de alarma. ' +
+        'Añade los números o plazos que conviene confirmar por escrito. No es asesoramiento legal ni financiero: si algo es delicado, indícame que lo consulte con un profesional.',
+    },
+    {
+      id: 'reunion', icon: '📅', name: 'Escáner de Reuniones Inútiles',
+      desc: '¿Debería ser un correo? Con frase para declinar.',
+      fields: [{ label: 'Invitación o descripción de la reunión', ph: 'Título, asistentes, agenda, duración…', req: true, rows: 5 }],
+      prompt:
+        'Evalúa si esta reunión debería ser un correo o un mensaje. Devuelve: 1) Veredicto (necesaria, mejorable o innecesaria) con un % de confianza; 2) Por qué; ' +
+        '3) Qué cambiaría para acortarla o convertirla en asíncrona; 4) Una frase cortés para declinar o proponer una alternativa; 5) Tres preguntas que haría antes de aceptar.',
+    },
+    {
+      id: 'greenwashing', icon: '🌿', name: 'Greenwashing Detector',
+      desc: 'Qué afirmaciones «eco» son vagas, comprobables o engañosas.',
+      fields: [{ label: 'Texto de la etiqueta o anuncio', ph: 'Pega aquí las afirmaciones', req: true, rows: 5 }],
+      prompt:
+        'Analiza este texto de una etiqueta o anuncio «ecológico». Clasifica cada afirmación como vaga, comprobable o potencialmente engañosa y explica por qué. ' +
+        'Indica qué certificaciones o datos concretos la harían creíble y qué debería comprobar yo. Sin sermones y sin acusar a la empresa de mala fe: valora solo la solidez de las afirmaciones.',
+    },
+    {
+      id: 'receta', icon: '🍳', name: 'Receta con Lo Que Hay',
+      desc: 'Una receta posible con tus ingredientes y tu tiempo.',
+      fields: [
+        { label: 'Ingredientes que tienes', ph: 'Huevos, arroz, medio pimiento…', req: true, rows: 3 },
+        { label: 'Tiempo y restricciones (opcional)', ph: '20 minutos, sin lácteos…', rows: 2 },
+      ],
+      prompt:
+        'Propón una receta realista con los ingredientes que tengo. Devuelve: 1) Nombre del plato; 2) Qué ingredientes usa y qué básicos de despensa daría por supuestos; ' +
+        '3) Pasos numerados y cortos; 4) Tiempo total; 5) Un cambio opcional si me falta algo. Respeta mis restricciones y no añadas ingredientes raros.',
+    },
+  ];
+
+  function buildToolPrompt(spec, values) {
+    const body = spec.fields
+      .map((f, i) => (values[i].trim() ? f.label + ':\n' + values[i].trim() : ''))
+      .filter(Boolean)
+      .join('\n\n');
+    return spec.prompt + (body ? '\n\n' + body : '') + '\n\n' + SUFFIX;
+  }
+  /* ===== TOOLS:END ===== */
+
+  /* ====================================================================
+   *  CAPA DE NAVEGADOR (DOM, adaptadores, interfaz)
+   * ==================================================================== */
+
+  const SETTINGS_KEY = 'promptshield:settings:v1';
+  const settings = loadSettings(); // { enabled, mode: 'ask' | 'auto' }
+  const vault = new Core.Vault();
+  Core.setDisabled(settings.off);
+  let customTerms = []; // palabras propias: solo en memoria, nunca se guardan
+  const stats = { protected: 0, bypassed: 0 };
+  let bypass = 0; // >0 mientras PromptShield dispara un envío legítimo
+  let busy = false;
+  let modalOpen = false;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const squash = (s) => s.replace(/\s+/g, '');
+
+  function loadSettings() {
+    const d = { enabled: true, mode: 'ask', theme: 'auto', off: [] };
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return d;
+      const o = JSON.parse(raw);
+      return {
+        enabled: typeof o.enabled === 'boolean' ? o.enabled : d.enabled,
+        mode: o.mode === 'auto' ? 'auto' : 'ask',
+        theme: o.theme === 'light' || o.theme === 'dark' ? o.theme : 'auto',
+        off: Array.isArray(o.off) ? o.off.filter((t) => typeof t === 'string' && t !== 'SECRETO') : [],
+      };
+    } catch (_) {
+      return d;
+    }
+  }
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); // solo ajustes, nunca datos
+    } catch (_) {
+      /* almacenamiento no disponible: se ignora */
+    }
+  }
+
+  /* ---------- Utilidades DOM ---------- */
+
+  function visible(el) {
+    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  }
+
+  // Constructor de nodos SIN innerHTML (compatible con Trusted Types y sin XSS).
+  function h(tag, attrs, ...children) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === 'class') el.className = v;
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+      else if (v !== false && v != null) el.setAttribute(k, String(v));
+    }
+    for (const c of children.flat()) {
+      if (c == null) continue;
+      el.append(typeof c === 'object' ? c : document.createTextNode(String(c)));
+    }
+    return el;
+  }
+
+  /* ---------- Lectura/escritura del editor ---------- */
+
+  // Texto "virtual" de un contenteditable: concatena los nodos de texto e inserta
+  // "\n" entre bloques/<br>, guardando a qué nodo pertenece cada tramo.
+  function buildVirtual(root) {
+    const segs = [];
+    let text = '';
+    let prevBlock = null;
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        if (n.nodeName === 'BR') text += '\n';
+        continue;
+      }
+      const block = blockOf(n, root);
+      if (prevBlock && block !== prevBlock) text += '\n';
+      prevBlock = block;
+      segs.push({ node: n, start: text.length });
+      text += n.data;
+    }
+    return { text, segs };
+  }
+
+  function blockOf(node, root) {
+    let el = node.parentElement;
+    while (el && el !== root) {
+      if (!getComputedStyle(el).display.startsWith('inline')) return el;
+      el = el.parentElement;
+    }
+    return root;
+  }
+
+  function locate(v, off, isEnd) {
+    for (const s of v.segs) {
+      const len = s.node.data.length;
+      const hit = isEnd ? off > s.start && off <= s.start + len : off >= s.start && off < s.start + len;
+      if (hit) return { node: s.node, offset: off - s.start };
+    }
+    return null;
+  }
+
+  function readEditorText(editor) {
+    return editor instanceof HTMLTextAreaElement ? editor.value : buildVirtual(editor).text;
+  }
+
+  function setTextareaValue(el, text) {
+    // Setter nativo: React ignora asignaciones directas a .value.
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(el, text);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  // Sustituye un rango del contenteditable simulando que el usuario escribe
+  // (así ProseMirror/Quill/Lexical actualizan su estado interno).
+  function replaceRange(editor, v, start, end, placeholder) {
+    const a = locate(v, start, false);
+    const b = locate(v, end, true);
+    if (!a || !b) return false;
+    const range = document.createRange();
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, b.offset);
+    editor.focus();
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    if (document.execCommand('insertText', false, placeholder)) return true;
+    try {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', placeholder);
+      editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Sustituye TODO el contenido del editor por `text` (admite varias líneas).
+  // Devuelve true solo si el editor acaba mostrando exactamente ese texto.
+  async function setEditorText(editor, text) {
+    if (editor instanceof HTMLTextAreaElement) {
+      setTextareaValue(editor, text);
+      await sleep(40);
+      return squash(editor.value) === squash(text);
+    }
+    const selectAll = () => {
+      editor.focus();
+      const r = document.createRange();
+      r.selectNodeContents(editor);
+      const s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+    };
+    const same = () => squash(readEditorText(editor)) === squash(text);
+
+    // Plan A: pegado simulado (ProseMirror/Quill lo gestionan con párrafos correctos).
+    selectAll();
+    try {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    } catch (_) {
+      /* se pasa al plan B */
+    }
+    await sleep(150);
+    if (same()) return true;
+
+    // Plan B: línea a línea con párrafos.
+    selectAll();
+    document.execCommand('delete');
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (i) document.execCommand('insertParagraph');
+      if (lines[i]) document.execCommand('insertText', false, lines[i]);
+    }
+    await sleep(150);
+    return same();
+  }
+
+  /**
+   * Protege el contenido del editor. Devuelve { ok, count }.
+   * ok=true SOLO si, tras sustituir, una nueva detección no encuentra nada.
+   */
+  async function protectEditor(editor) {
+    if (editor instanceof HTMLTextAreaElement) {
+      const { text, findings } = Core.pseudonymize(editor.value, vault);
+      setTextareaValue(editor, text);
+      await sleep(40);
+      return { ok: Core.detect(readEditorText(editor)).length === 0, count: findings.length };
+    }
+
+    // 1) Se registran los marcadores en orden de aparición (numeración natural).
+    const first = Core.detect(buildVirtual(editor).text);
+    first.forEach((f) => Core.assignExpanded(vault, f));
+
+    // 2) Se sustituye de derecha a izquierda recalculando tras cada edición
+    //    (el DOM del editor puede reconstruirse entre ediciones).
+    const maxIter = first.length + 5;
+    for (let i = 0; i < maxIter; i++) {
+      const v = buildVirtual(editor);
+      const found = Core.detect(v.text);
+      if (!found.length) break;
+      const last = found[found.length - 1];
+      if (!replaceRange(editor, v, last.start, last.end, Core.assignExpanded(vault, last))) break;
+      await sleep(15);
+    }
+    await sleep(40);
+    return { ok: Core.detect(buildVirtual(editor).text).length === 0, count: first.length };
+  }
+
+  /* ---------- Adaptadores por sitio (la parte más frágil: selectores aislados) ---------- */
+
+  const EDITOR_SELECTORS = [
+    '#prompt-textarea', // ChatGPT
+    'div.ProseMirror[contenteditable]:not([contenteditable="false"])', // Claude / ChatGPT
+    'rich-textarea .ql-editor', // Gemini
+    'div.ql-editor[contenteditable]:not([contenteditable="false"])',
+    'textarea',
+  ];
+  const SEND_SELECTORS = [
+    'button[data-testid="send-button"]', // ChatGPT
+    'button[aria-label*="Send" i]', // Claude y otros (EN)
+    'button[aria-label*="Enviar" i]', // Gemini y otros (ES)
+    'button.send-button',
+    'button[type="submit"]',
+  ];
+  const EDITABLE_CLOSEST =
+    'textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"]';
+
+  function resolveEditor(target) {
+    if (!(target instanceof Element)) return null;
+    const el = target.closest(EDITABLE_CLOSEST);
+    return el && visible(el) ? el : null;
+  }
+
+  function findPromptEditor() {
+    for (const sel of EDITOR_SELECTORS) {
+      const els = Array.from(document.querySelectorAll(sel)).filter(visible);
+      if (els.length) return els[els.length - 1];
+    }
+    return null;
+  }
+
+  function isSendButton(btn) {
+    return SEND_SELECTORS.some((sel) => btn.matches(sel));
+  }
+
+  function findSendButton(editor) {
+    let scope = editor;
+    for (let i = 0; i < 8 && scope; i++, scope = scope.parentElement) {
+      for (const sel of SEND_SELECTORS) {
+        const b = Array.from(scope.querySelectorAll(sel)).find(visible);
+        if (b) return b;
+      }
+    }
+    return null;
+  }
+
+  const isEnabled = (b) => !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+
+  async function waitFor(fn, timeout) {
+    const t0 = Date.now();
+    for (;;) {
+      const r = fn();
+      if (r) return r;
+      if (Date.now() - t0 > timeout) return null;
+      await sleep(50);
+    }
+  }
+
+  function withBypass(fn) {
+    bypass++;
+    try {
+      fn();
+    } finally {
+      bypass--;
+    }
+  }
+
+  async function sendNow(editor) {
+    await sleep(80);
+    const btn = await waitFor(() => {
+      const b = findSendButton(editor);
+      return b && isEnabled(b) ? b : null;
+    }, 1500);
+    withBypass(() => {
+      if (btn) btn.click();
+      else
+        editor.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })
+        );
+    });
+    await sleep(900);
+    if (document.contains(editor) && readEditorText(editor).trim()) {
+      toast('Texto listo. Pulsa Enviar manualmente.', 'warn');
+    }
+  }
+
+  /* ---------- Interceptación del envío ---------- */
+
+  function block(e) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+
+  function handleSubmitAttempt(e, editor) {
+    if (modalOpen || busy) {
+      block(e);
+      return;
+    }
+    let findings;
+    try {
+      findings = Core.detect(readEditorText(editor));
+    } catch (err) {
+      block(e); // FALLO SEGURO: ante cualquier error, no se envía nada
+      showModal({ kind: 'error', error: err, editor });
+      return;
+    }
+    if (!findings.length) return; // nada sensible: el envío sigue su curso
+    block(e);
+    if (settings.mode === 'auto') runProtectAndSend(editor);
+    else showModal({ kind: 'findings', findings, editor });
+  }
+
+  function onKeydown(e) {
+    // Atajos: Alt+Mayús+S pausa/activa la protección; Alt+Mayús+T abre las herramientas.
+    if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && !modalOpen) {
+      if (e.code === 'KeyS') {
+        e.preventDefault();
+        settings.enabled = !settings.enabled;
+        saveSettings();
+        refreshPill();
+        toast(settings.enabled ? 'Protección activada' : 'Protección en pausa', settings.enabled ? 'ok' : 'warn');
+        return;
+      }
+      if (e.code === 'KeyT') {
+        e.preventDefault();
+        showTools();
+        return;
+      }
+    }
+    if (!settings.enabled || bypass > 0) return;
+    if (e.key !== 'Enter' || e.shiftKey || e.altKey || e.isComposing) return;
+    const editor = resolveEditor(e.target);
+    if (editor) handleSubmitAttempt(e, editor);
+  }
+
+  function onClick(e) {
+    // Un clic fuera de PromptShield cierra el panel (dentro, el target es el host).
+    if (panel && !panel.hidden && e.target !== host) panel.hidden = true;
+    if (!settings.enabled || bypass > 0) return;
+    if (!(e.target instanceof Element)) return;
+    const btn = e.target.closest('button, [role="button"]');
+    if (!btn || !isSendButton(btn)) return;
+    const editor = findPromptEditor();
+    if (editor) handleSubmitAttempt(e, editor);
+  }
+
+  function onSubmit(e) {
+    if (!settings.enabled || bypass > 0) return;
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const editor = Array.from(form.querySelectorAll(EDITABLE_CLOSEST)).find(visible);
+    if (editor) handleSubmitAttempt(e, editor);
+  }
+
+  async function runProtectAndSend(editor) {
+    if (busy) return;
+    busy = true;
+    try {
+      const { ok, count } = await protectEditor(editor);
+      if (!ok) {
+        showModal({
+          kind: 'error',
+          error: new Error('No se pudo sustituir el texto de forma verificable en este editor.'),
+          editor,
+        });
+        return;
+      }
+      stats.protected += count;
+      refreshPill();
+      toast(count + ' dato(s) protegido(s)', 'ok');
+      await sendNow(editor);
+    } catch (err) {
+      showModal({ kind: 'error', error: err, editor });
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function runSendUnprotected(editor) {
+    if (busy) return;
+    busy = true;
+    try {
+      stats.bypassed++;
+      await sendNow(editor);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Envío de un texto sin datos sensibles (o con la protección pausada).
+  async function runSendPlain(editor) {
+    if (busy) return;
+    busy = true;
+    try {
+      await sendNow(editor);
+    } catch (err) {
+      showModal({ kind: 'error', error: err, editor });
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Misma política que un envío manual: detectar -> (preguntar | proteger) -> enviar.
+  async function submitPrompt(editor) {
+    let findings = [];
+    if (settings.enabled) {
+      try {
+        findings = Core.detect(readEditorText(editor));
+      } catch (err) {
+        showModal({ kind: 'error', error: err, editor }); // FALLO SEGURO
+        return;
+      }
+    }
+    if (!findings.length) await runSendPlain(editor);
+    else if (settings.mode === 'auto') await runProtectAndSend(editor);
+    else showModal({ kind: 'findings', findings, editor });
+  }
+
+  /* ---------- Herramientas: ejecución ---------- */
+
+  async function runTool(text) {
+    const editor = findPromptEditor();
+    if (!editor) {
+      toast('No encuentro el cuadro de texto de este chat.', 'warn');
+      return;
+    }
+    if (busy) return;
+    busy = true;
+    let ok = false;
+    try {
+      ok = await setEditorText(editor, text);
+    } catch (_) {
+      ok = false;
+    } finally {
+      busy = false;
+    }
+    if (!ok) {
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch (_) {
+        /* sin permiso de portapapeles */
+      }
+      toast(
+        copied
+          ? 'El editor no aceptó el texto. Lo he copiado: pégalo con Ctrl+V.'
+          : 'El editor no aceptó el texto. Prueba a pegarlo a mano.',
+        'warn'
+      );
+      return;
+    }
+    await submitPrompt(editor); // la protección se aplica igual que a cualquier mensaje
+  }
+
+  /* ---------- Restauración en las respuestas ---------- */
+
+  const SKIP_SEL =
+    'textarea, input, script, style, noscript, [contenteditable]:not([contenteditable="false"])';
+  const BLOCK_SEL = 'p, li, td, th, h1, h2, h3, h4, h5, h6, pre, blockquote, div';
+
+  // Restaura marcadores aunque el streaming los parta entre varios nodos de texto.
+  function restoreIn(scope) {
+    if (!scope || scope.closest(SKIP_SEL)) return;
+    if (!Core.hasPlaceholder(scope.textContent || '')) return;
+
+    const segs = [];
+    let full = '';
+    const w = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      if (n.parentElement && n.parentElement.closest(SKIP_SEL)) continue;
+      segs.push({ n, start: full.length, len: n.data.length });
+      full += n.data;
+    }
+
+    const re = new RegExp(Core.PLACEHOLDER_SRC, 'g');
+    const edits = [];
+    let m;
+    while ((m = re.exec(full)) !== null) {
+      const val = vault.lookup(m[0]);
+      if (val !== undefined) edits.push({ s: m.index, e: m.index + m[0].length, val });
+    }
+
+    // De derecha a izquierda: las ediciones posteriores no alteran los offsets anteriores.
+    for (let k = edits.length - 1; k >= 0; k--) {
+      const { s, e, val } = edits[k];
+      const i1 = segs.findIndex((g) => g.start <= s && s < g.start + g.len);
+      const i2 = segs.findIndex((g) => g.start <= e - 1 && e - 1 < g.start + g.len);
+      if (i1 < 0 || i2 < 0) continue;
+      const o1 = s - segs[i1].start;
+      const o2 = e - segs[i2].start;
+      if (i1 === i2) {
+        const d = segs[i1].n.data;
+        segs[i1].n.data = d.slice(0, o1) + val + d.slice(o2);
+      } else {
+        segs[i1].n.data = segs[i1].n.data.slice(0, o1) + val;
+        for (let j = i1 + 1; j < i2; j++) segs[j].n.data = '';
+        segs[i2].n.data = segs[i2].n.data.slice(o2);
+      }
+    }
+  }
+
+  function restoreNode(node) {
+    if (vault.size === 0) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const p = node.parentElement;
+      if (p) restoreIn(p.closest(BLOCK_SEL) || p);
+    } else if (node.nodeType === Node.ELEMENT_NODE) {
+      restoreIn(node);
+    }
+  }
+
+  function startRestoreObserver() {
+    const mo = new MutationObserver((muts) => {
+      if (vault.size === 0) return;
+      for (const m of muts) {
+        if (m.type === 'characterData') restoreNode(m.target);
+        else m.addedNodes.forEach(restoreNode);
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+  }
+
+  /* ---------- Interfaz (Shadow DOM cerrado, sin innerHTML) ---------- */
+
+  const VERSION = '3.0.0';
+  const AUTHOR = 'IzanHermoso';
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  // Iconos de trazo (24x24). Se crean con createElementNS: sin innerHTML, compatible con Trusted Types.
+  const ICONS = {
+    shield: ['M12 3l7 3v5.5c0 4.4-2.9 7.9-7 9.5-4.1-1.6-7-5.1-7-9.5V6l7-3z', 'M9 12l2.2 2.2L15.5 10'],
+    grid: ['M4 4h6v6H4z', 'M14 4h6v6h-6z', 'M4 14h6v6H4z', 'M14 14h6v6h-6z'],
+    sliders: ['M4 7h9', 'M17 7h3', 'M4 17h3', 'M11 17h9', 'M15 5v4', 'M9 15v4'],
+    eye: ['M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z', 'M12 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z'],
+    back: ['M15 5l-7 7 7 7'],
+    close: ['M6 6l12 12', 'M18 6L6 18'],
+    search: ['M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z', 'M20 20l-4-4'],
+    send: ['M4 12l16-8-6 16-3-7-7-1z'],
+    alert: ['M12 4l9 16H3L12 4z', 'M12 10v4', 'M12 17.2v.1'],
+    lock: ['M6 11h12v9H6z', 'M8.5 11V8a3.5 3.5 0 0 1 7 0v3'],
+  };
+
+  function icon(name) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    const attrs = {
+      viewBox: '0 0 24 24', width: '16', height: '16', fill: 'none', stroke: 'currentColor',
+      'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', class: 'ic',
+    };
+    for (const k of Object.keys(attrs)) svg.setAttribute(k, attrs[k]);
+    for (const d of ICONS[name] || []) {
+      const p = document.createElementNS(SVG_NS, 'path');
+      p.setAttribute('d', d);
+      svg.append(p);
+    }
+    return svg;
+  }
+
+  const CAT = {
+    indirectas: 'Comunicación', jefe: 'Comunicación', tono: 'Comunicación', rechazo: 'Comunicación', cerebros: 'Comunicación',
+    zombis: 'Dinero', negociador: 'Dinero', contrato: 'Dinero', greenwashing: 'Dinero',
+    errores: 'Trabajo', reunion: 'Trabajo', diablo: 'Trabajo',
+    grupos: 'Vida diaria', tutor: 'Vida diaria', habitos: 'Vida diaria', receta: 'Vida diaria',
+  };
+  const catOf = (t) => CAT[t.id] || 'Otras';
+
+  /*
+   * Sistema de diseño "Tinta y latón"
+   *  - Papel cálido + tinta verdosa; acento verde pino; latón solo para la firma y detalles.
+   *  - Titulares en serif editorial (stack del sistema, sin descargas), texto en sans del sistema.
+   *  - Cifras tabulares, radios 8/12/16/18, sombras suaves y movimiento corto (≤ 240 ms).
+   */
+  const CSS = `
+:host{all:initial;
+ --bg:#fbfaf7;--surface:#f4f1e9;--raised:#ffffff;--fg:#1c2123;--muted:#666b67;--faint:#9a9d96;--bd:#e4dfd2;--bd2:#d3ccba;
+ --ac:#1f5f55;--ac-h:#174a42;--on-ac:#fbfaf7;--ac-soft:rgba(31,95,85,.10);
+ --brass:#8f6620;--on-brass:#ffffff;--dn:#b3402a;--dn-soft:rgba(179,64,42,.10);
+ --sh:0 1px 2px rgba(28,33,35,.06),0 14px 34px -10px rgba(28,33,35,.28);
+ --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+ --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+ --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+ --ease:cubic-bezier(.2,.8,.2,1);
+ font:13px/1.5 var(--sans);color:var(--fg);-webkit-font-smoothing:antialiased}
+@media (prefers-color-scheme:dark){:host(:not([data-theme="light"])){--bg:#161a1b;--surface:#1d2324;--raised:#232a2c;--fg:#ece8df;--muted:#9aa29d;--faint:#6f7773;--bd:#2c3537;--bd2:#3a4547;--ac:#6cc4b0;--ac-h:#86d3c1;--on-ac:#0f1a17;--ac-soft:rgba(108,196,176,.13);--brass:#d2a85a;--on-brass:#1b1408;--dn:#e5826b;--dn-soft:rgba(229,130,107,.13);--sh:0 1px 2px rgba(0,0,0,.4),0 18px 44px -10px rgba(0,0,0,.75)}}
+:host([data-theme="dark"]){--bg:#161a1b;--surface:#1d2324;--raised:#232a2c;--fg:#ece8df;--muted:#9aa29d;--faint:#6f7773;--bd:#2c3537;--bd2:#3a4547;--ac:#6cc4b0;--ac-h:#86d3c1;--on-ac:#0f1a17;--ac-soft:rgba(108,196,176,.13);--brass:#d2a85a;--on-brass:#1b1408;--dn:#e5826b;--dn-soft:rgba(229,130,107,.13);--sh:0 1px 2px rgba(0,0,0,.4),0 18px 44px -10px rgba(0,0,0,.75)}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:var(--bd2) transparent}
+button{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.ic{width:16px;height:16px;flex:none}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+
+.pill{position:fixed;right:18px;bottom:18px;z-index:2147483646;display:flex;align-items:center;gap:9px;height:40px;padding:0 14px 0 7px;border-radius:12px;
+ background:var(--raised);color:var(--fg);border:1px solid var(--bd);box-shadow:var(--sh);cursor:pointer;user-select:none;font-weight:600;letter-spacing:-.01em;
+ transition:transform .2s var(--ease),border-color .2s}
+.pill:hover{transform:translateY(-2px);border-color:var(--bd2)}
+.pill:active{transform:scale(.98)}
+.mark{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:var(--ac);color:var(--on-ac);transition:background .2s}
+.mark .ic{width:15px;height:15px}
+.mark.lg{width:36px;height:36px;border-radius:11px}.mark.lg .ic{width:20px;height:20px}
+.pill[data-on="false"] .mark{background:var(--faint)}
+.pill[data-on="false"] .plabel{color:var(--muted);font-weight:500}
+.pcount{min-width:20px;padding:2px 6px;border-radius:999px;background:var(--ac-soft);color:var(--ac);font-size:11px;font-weight:700;text-align:center;font-variant-numeric:tabular-nums}
+.pcount[hidden]{display:none}
+
+.panel{position:fixed;right:18px;bottom:70px;z-index:2147483646;width:min(320px,calc(100vw - 36px));border-radius:16px;background:var(--bg);color:var(--fg);
+ border:1px solid var(--bd);box-shadow:var(--sh);overflow:hidden;transform-origin:bottom right;animation:rise .22s var(--ease)}
+.panel[hidden]{display:none}
+.phead{display:flex;align-items:center;gap:12px;padding:16px;border-bottom:1px solid var(--bd);background:var(--surface)}
+.ptitle{display:flex;flex-direction:column;line-height:1.25}
+.ptitle strong{font:600 18px/1.2 var(--serif);letter-spacing:-.01em}
+.ptitle span{color:var(--muted);font-size:12px}
+.pbody{display:flex;flex-direction:column;gap:14px;padding:16px}
+.line{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.line.stack{flex-direction:column;align-items:stretch;gap:6px}
+.lbl{font-weight:600;font-size:12px}
+.hint{color:var(--muted);font-size:12px;margin:0}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stats>div{display:flex;flex-direction:column;padding:10px 12px;border:1px solid var(--bd);border-radius:12px;background:var(--surface)}
+.stats b{font:600 26px/1.1 var(--serif);font-variant-numeric:tabular-nums}
+.stats span{color:var(--muted);font-size:11.5px;margin-top:2px}
+.linkbtn{align-self:flex-start;border:0;background:none;color:var(--muted);padding:2px 0;cursor:pointer;text-decoration:underline;text-decoration-color:var(--bd2);text-underline-offset:3px;transition:color .15s}
+.linkbtn:hover{color:var(--fg)}
+.pfoot,.cfoot{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.pfoot{padding:12px 16px;border-top:1px solid var(--bd);background:var(--surface)}
+.cfoot{margin-top:18px;padding-top:14px;border-top:1px solid var(--bd)}
+.ver{color:var(--faint);font-size:11px;font-variant-numeric:tabular-nums}
+
+.credit{display:inline-flex;align-items:center;gap:8px;padding:3px 12px 3px 3px;border:1px solid var(--bd2);border-radius:999px;background:var(--surface);color:var(--muted);font-size:11.5px;white-space:nowrap;cursor:default;
+ border-color:color-mix(in srgb,var(--brass) 45%,var(--bd));background:color-mix(in srgb,var(--brass) 9%,transparent)}
+.credit b{color:var(--fg);font-weight:650;letter-spacing:.01em}
+.seal{display:grid;place-items:center;width:21px;height:21px;border-radius:50%;background:var(--brass);color:var(--on-brass);font:italic 700 9.5px/1 var(--serif);letter-spacing:.02em}
+
+.sw{position:relative;flex:none;width:38px;height:22px;border:0;border-radius:999px;background:var(--bd2);cursor:pointer;transition:background .2s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.35);transition:transform .22s var(--ease)}
+.sw[aria-checked="true"]{background:var(--ac)}
+.sw[aria-checked="true"]::after{transform:translateX(16px)}
+.seg{display:flex;gap:2px;padding:2px;border:1px solid var(--bd);border-radius:10px;background:var(--surface)}
+.seg button{flex:1;padding:5px 8px;border:0;border-radius:8px;background:transparent;color:var(--muted);font-weight:500;cursor:pointer;transition:background .15s,color .15s,box-shadow .15s}
+.seg button:hover{color:var(--fg)}
+.seg button[aria-pressed="true"]{background:var(--raised);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.14)}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 14px;border-radius:10px;border:1px solid var(--bd2);background:var(--raised);color:var(--fg);font-weight:500;cursor:pointer;
+ transition:background .15s,border-color .15s,transform .15s var(--ease)}
+.btn:hover{border-color:var(--faint);background:var(--surface)}
+.btn:active{transform:scale(.98)}
+.btn.primary{background:var(--ac);border-color:var(--ac);color:var(--on-ac);font-weight:600}
+.btn.primary:hover{background:var(--ac-h);border-color:var(--ac-h)}
+.btn.danger{color:var(--dn);border-color:transparent;background:var(--dn-soft)}
+.btn.danger:hover{border-color:var(--dn)}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+.btn.ghost:hover{color:var(--fg);background:var(--surface)}
+.btn.wide{width:100%}
+.btn .grow{flex:1;text-align:left}
+kbd{padding:3px 5px;border-radius:5px;background:var(--surface);border:1px solid var(--bd);color:var(--muted);font:600 10.5px/1 var(--sans);letter-spacing:.02em}
+.btn.primary kbd{background:rgba(255,255,255,.16);border-color:transparent;color:inherit}
+.grow{flex:1}
+
+.overlay{position:fixed;inset:0;z-index:2147483646;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(16,20,21,.5);backdrop-filter:blur(4px);animation:fade .18s ease-out}
+.card{width:min(480px,100%);max-height:calc(100vh - 32px);overflow:auto;padding:22px 24px;border:1px solid var(--bd);border-radius:18px;background:var(--bg);color:var(--fg);box-shadow:var(--sh);animation:rise .24s var(--ease)}
+.card.wide{width:min(680px,100%)}
+.chead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:6px}
+.eyebrow{margin-bottom:4px;color:var(--ac);font-size:10.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
+.eyebrow.warn{color:var(--dn)}
+.chead h2{margin:0;font:600 23px/1.2 var(--serif);letter-spacing:-.015em}
+.x{display:grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;transition:background .15s,color .15s}
+.x:hover{background:var(--surface);color:var(--fg)}
+.lead{margin:6px 0 14px;color:var(--muted);font-size:13.5px;line-height:1.55}
+.actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:18px}
+
+.list{max-height:220px;margin:12px 0;padding:0;overflow:auto;list-style:none;border:1px solid var(--bd);border-radius:12px;background:var(--surface)}
+.list li{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;border-bottom:1px solid var(--bd)}
+.list li:last-child{border-bottom:0}
+.chip{padding:3px 8px;border-radius:6px;background:var(--ac-soft);color:var(--ac);font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase}
+.list code{color:var(--muted);font:12.5px var(--mono)}
+.preview{max-height:180px;margin:10px 0 0;padding:10px 12px;overflow:auto;white-space:pre-wrap;word-break:break-word;border:1px solid var(--bd);border-radius:12px;background:var(--surface);font:12px/1.55 var(--mono)}
+.preview[hidden]{display:none}
+
+.field{position:relative;display:flex;align-items:center}
+.field .ic{position:absolute;left:12px;color:var(--faint);pointer-events:none}
+.search{width:100%;height:40px;padding:0 12px 0 36px;border:1px solid var(--bd2);border-radius:12px;background:var(--raised);color:var(--fg);font:inherit;transition:border-color .15s,box-shadow .15s}
+.search:focus,textarea.in:focus{outline:none;border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-soft)}
+.search::placeholder,textarea.in::placeholder{color:var(--faint)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 4px}
+.chipbtn{padding:4px 12px;border:1px solid var(--bd);border-radius:999px;background:transparent;color:var(--muted);font-weight:500;cursor:pointer;transition:background .15s,color .15s,border-color .15s}
+.chipbtn:hover{color:var(--fg);border-color:var(--bd2)}
+.chipbtn[aria-pressed="true"]{background:var(--fg);border-color:var(--fg);color:var(--bg)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px;margin:12px 0 4px}
+.tcard{display:flex;flex-direction:column;align-items:flex-start;gap:4px;padding:14px;text-align:left;border:1px solid var(--bd);border-radius:14px;background:var(--raised);cursor:pointer;
+ animation:rise .3s var(--ease) both;transition:border-color .18s,transform .18s var(--ease),box-shadow .18s}
+.tcard[hidden]{display:none}
+.tcard:hover{border-color:var(--ac);transform:translateY(-2px);box-shadow:0 10px 22px -12px rgba(28,33,35,.4)}
+.tcard:active{transform:scale(.985)}
+.tnum{color:var(--ac);font:italic 600 13px/1 var(--serif);letter-spacing:.02em}
+.tcard strong{margin-top:6px;font-size:13.5px;font-weight:650}
+.tdesc{color:var(--muted);font-size:12.5px;line-height:1.45}
+.tcat{margin-top:6px;color:var(--faint);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
+.empty{grid-column:1/-1;padding:26px 0;text-align:center;color:var(--muted)}
+.empty[hidden]{display:none}
+
+.fld{display:flex;flex-direction:column;gap:6px;margin:14px 0}
+.flabel{font-size:12.5px;font-weight:600}
+.flabel i{color:var(--ac);font-style:normal}
+textarea.in{min-height:76px;padding:10px 12px;resize:vertical;border:1px solid var(--bd2);border-radius:12px;background:var(--raised);color:var(--fg);font:inherit;line-height:1.5;transition:border-color .15s,box-shadow .15s}
+.intro{margin:12px 0;padding:10px 14px;white-space:pre-line;border-left:3px solid var(--brass);border-radius:0 10px 10px 0;background:var(--surface);color:var(--muted);font-size:12.5px;line-height:1.6}
+.rules{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}
+.opt{display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid var(--bd);border-radius:10px;background:var(--raised);cursor:pointer}
+.opt input{width:15px;height:15px;accent-color:var(--ac)}
+
+.toasts{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);z-index:2147483647;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
+.toast{max-width:min(420px,90vw);padding:10px 16px;border-left:3px solid #6cc4b0;border-radius:10px;background:#1c2123;color:#f3efe6;font-weight:500;box-shadow:0 12px 30px -8px rgba(0,0,0,.55);animation:rise .22s var(--ease)}
+.toast.ok{border-left-color:#6fc08f}
+.toast.warn{border-left-color:#d2a85a}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+`;
+
+  let host, root, wrap, pill, pillLabel, pillCount, panel, toasts, overlay, swEl;
+  const statNodes = {};
+
+  function mountUI() {
+    host = document.createElement('div');
+    host.id = 'promptshield-host';
+    root = host.attachShadow({ mode: 'closed' });
+    applyTheme();
+
+    pillLabel = h('span', { class: 'plabel' }, 'PromptShield');
+    pillCount = h('span', { class: 'pcount' }, '0');
+    pillCount.hidden = true;
+    pill = h('div', {
+      class: 'pill', role: 'button', tabindex: '0', 'aria-label': 'PromptShield: abrir panel',
+      title: 'PromptShield · Creado por ' + AUTHOR, onclick: togglePanel,
+      onkeydown: (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          togglePanel();
+        }
+      },
+    }, h('span', { class: 'mark' }, icon('shield')), pillLabel, pillCount);
+    panel = buildPanel();
+    panel.hidden = true;
+    toasts = h('div', { class: 'toasts' });
+    wrap = h('div', { class: 'ps' }, pill, panel, toasts);
+    root.append(wrap);
+    document.documentElement.append(host);
+    console.info('[PromptShield] estilos aplicados por:', installStyles());
+    refreshPill();
+  }
+
+  function applyTheme() {
+    if (settings.theme === 'auto') host.removeAttribute('data-theme');
+    else host.setAttribute('data-theme', settings.theme);
+  }
+
+  // Parte el CSS en reglas de primer nivel (para insertarlas una a una por CSSOM).
+  function splitRules(css) {
+    const out = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < css.length; i++) {
+      if (css[i] === '{') depth++;
+      else if (css[i] === '}' && --depth === 0) {
+        out.push(css.slice(start, i + 1).trim());
+        start = i + 1;
+      }
+    }
+    return out.filter(Boolean);
+  }
+
+  // Comprueba que los estilos se aplican de verdad (la píldora debe ser position:fixed).
+  function stylesWork() {
+    try {
+      return getComputedStyle(pill).position === 'fixed';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Algunas páginas (CSP estricta) bloquean ciertas vías de carga de CSS: se prueban en orden y se verifica cada una.
+  function installStyles() {
+    try {
+      const sheet = new CSSStyleSheet();
+      sheet.replaceSync(CSS);
+      root.adoptedStyleSheets = [sheet];
+      if (stylesWork()) return 'hoja construible';
+    } catch (_) {
+      /* siguiente vía */
+    }
+    try {
+      root.adoptedStyleSheets = [];
+    } catch (_) {
+      /* ignorado */
+    }
+    const st = document.createElement('style');
+    st.textContent = CSS;
+    root.append(st);
+    if (stylesWork()) return '<style> con texto';
+    st.remove();
+    const st2 = document.createElement('style');
+    root.append(st2);
+    const sh = st2.sheet;
+    if (sh) {
+      for (const rule of splitRules(CSS)) {
+        try {
+          sh.insertRule(rule, sh.cssRules.length);
+        } catch (_) {
+          /* regla inválida: se omite */
+        }
+      }
+    }
+    if (stylesWork()) return 'CSSOM (insertRule)';
+    console.warn('[PromptShield] No se pudieron aplicar los estilos de la interfaz.');
+    return 'ninguna (fallo)';
+  }
+
+  function refreshPill() {
+    pill.dataset.on = String(settings.enabled);
+    pillLabel.textContent = settings.enabled ? 'PromptShield' : 'En pausa';
+    pillCount.textContent = String(stats.protected);
+    pillCount.hidden = !stats.protected;
+    if (swEl) swEl.setAttribute('aria-checked', String(settings.enabled));
+    if (statNodes.p) statNodes.p.textContent = String(stats.protected);
+    if (statNodes.b) statNodes.b.textContent = String(stats.bypassed);
+  }
+
+  function togglePanel() {
+    panel.hidden = !panel.hidden;
+  }
+
+  /* ---------- Piezas reutilizables ---------- */
+
+  // Distintivo de autoría (visible en el panel y en el selector de herramientas).
+  function credit() {
+    return h('span', { class: 'credit', title: 'Diseño y desarrollo' },
+      h('span', { class: 'seal', 'aria-hidden': 'true' }, 'IH'),
+      h('span', {}, 'Creado por ', h('b', {}, AUTHOR)));
+  }
+
+  // Control segmentado accesible (sustituye a los <select>).
+  function seg(options, value, onpick) {
+    const el = h('div', { class: 'seg', role: 'group' });
+    const btns = options.map(([val, label]) => {
+      const b = h('button', { type: 'button', 'aria-pressed': String(val === value) }, label);
+      b.addEventListener('click', () => {
+        btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        onpick(val);
+      });
+      return b;
+    });
+    el.append(...btns);
+    return el;
+  }
+
+  function head(eyebrow, title, onclose, warn) {
+    return h('div', { class: 'chead' },
+      h('div', {}, h('div', { class: 'eyebrow' + (warn ? ' warn' : '') }, eyebrow), h('h2', {}, title)),
+      h('button', { class: 'x', type: 'button', 'aria-label': 'Cerrar', onclick: onclose }, icon('close')));
+  }
+
+  function buildPanel() {
+    swEl = h('button', {
+      class: 'sw', type: 'button', role: 'switch', 'aria-label': 'Protección activa', 'aria-checked': String(settings.enabled),
+      onclick: () => {
+        settings.enabled = !settings.enabled;
+        saveSettings();
+        refreshPill();
+      },
+    });
+    const modeSeg = seg([['ask', 'Preguntar'], ['auto', 'Automático']], settings.mode, (v) => {
+      settings.mode = v === 'auto' ? 'auto' : 'ask';
+      saveSettings();
+    });
+    const themeSeg = seg([['auto', 'Auto'], ['light', 'Claro'], ['dark', 'Oscuro']], settings.theme, (v) => {
+      settings.theme = v === 'light' || v === 'dark' ? v : 'auto';
+      saveSettings();
+      applyTheme();
+    });
+    const toolsBtn = h('button', { class: 'btn primary wide', type: 'button', onclick: () => {
+      panel.hidden = true;
+      showTools();
+    } }, icon('grid'), h('span', { class: 'grow' }, 'Abrir herramientas'), h('kbd', {}, '⌥⇧T'));
+    const rulesBtn = h('button', { class: 'btn wide', type: 'button', onclick: () => {
+      panel.hidden = true;
+      showRules();
+    } }, icon('sliders'), h('span', { class: 'grow' }, 'Reglas de protección'));
+    const clearBtn = h('button', { class: 'linkbtn', type: 'button', onclick: () => {
+      vault.clear();
+      toast('Datos de la sesión olvidados', 'warn');
+    } }, 'Olvidar datos de la sesión');
+    statNodes.p = h('b', {}, '0');
+    statNodes.b = h('b', {}, '0');
+
+    return h('div', { class: 'panel', role: 'dialog', 'aria-label': 'PromptShield' },
+      h('div', { class: 'phead' },
+        h('span', { class: 'mark lg' }, icon('shield')),
+        h('div', { class: 'ptitle' }, h('strong', {}, 'PromptShield'), h('span', {}, 'Cortafuegos de privacidad'))),
+      h('div', { class: 'pbody' },
+        h('div', { class: 'line' },
+          h('div', {}, h('div', { class: 'lbl' }, 'Protección'), h('p', { class: 'hint' }, 'Sustituye datos sensibles antes de enviar')),
+          swEl),
+        h('div', { class: 'line stack' }, h('div', { class: 'lbl' }, 'Modo'), modeSeg),
+        h('div', { class: 'line stack' }, h('div', { class: 'lbl' }, 'Tema'), themeSeg),
+        h('div', { class: 'line stack' }, toolsBtn, rulesBtn),
+        h('div', { class: 'stats' },
+          h('div', {}, statNodes.p, h('span', {}, 'Datos protegidos')),
+          h('div', {}, statNodes.b, h('span', {}, 'Enviados sin proteger'))),
+        clearBtn),
+      h('div', { class: 'pfoot' }, credit(), h('span', { class: 'ver' }, 'v' + VERSION)));
+  }
+
+  function toast(msg, kind) {
+    if (!toasts) return;
+    const t = h('div', { class: 'toast ' + (kind || '') }, msg);
+    toasts.append(t);
+    setTimeout(() => t.remove(), 4000);
+  }
+
+  /* ---------- Diálogos ---------- */
+
+  function closeModal(editor) {
+    if (overlay) overlay.remove();
+    overlay = null;
+    modalOpen = false;
+    if (editor && document.contains(editor)) editor.focus();
+  }
+
+  // Escape cierra; Tab queda atrapado dentro; el teclado no llega a la página.
+  function overlayKeys(editor) {
+    return (e) => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        closeModal(editor);
+        return;
+      }
+      if (e.key !== 'Tab' || !overlay) return;
+      const f = Array.from(overlay.querySelectorAll('button, textarea, select, input')).filter((el) => !el.disabled && !el.hidden);
+      if (!f.length) return;
+      const cur = root.activeElement;
+      if (e.shiftKey && cur === f[0]) {
+        e.preventDefault();
+        f[f.length - 1].focus();
+      } else if (!e.shiftKey && cur === f[f.length - 1]) {
+        e.preventDefault();
+        f[0].focus();
+      }
+    };
+  }
+
+  function openOverlay(card, focusEl, editor) {
+    if (overlay) overlay.remove();
+    modalOpen = true;
+    overlay = h('div', { class: 'overlay', onkeydown: overlayKeys(editor) }, card);
+    ['keyup', 'keypress', 'input'].forEach((t) => overlay.addEventListener(t, (ev) => ev.stopPropagation()));
+    wrap.append(overlay);
+    if (focusEl) focusEl.focus();
+  }
+
+  function showModal({ kind, findings, editor, error }) {
+    const cancel = h('button', { class: 'btn ghost', type: 'button', onclick: () => closeModal(editor) }, 'Cancelar');
+    const unprotected = h('button', { class: 'btn danger', type: 'button', onclick: () => {
+      closeModal(editor);
+      runSendUnprotected(editor);
+    } }, 'Enviar sin proteger');
+
+    if (kind === 'findings') {
+      const items = findings.slice(0, 8).map((f) =>
+        h('li', {}, h('span', { class: 'chip' }, Core.TYPE_LABEL[f.type] || f.type), h('code', {}, Core.maskValue(f.value))));
+      if (findings.length > 8) items.push(h('li', {}, h('span', { class: 'hint' }, 'y ' + (findings.length - 8) + ' más…')));
+      const protect = h('button', { class: 'btn primary', type: 'button', onclick: () => {
+        closeModal(editor);
+        runProtectAndSend(editor);
+      } }, icon('lock'), 'Proteger y enviar');
+      const previewBox = h('pre', { class: 'preview' });
+      previewBox.hidden = true;
+      const previewBtn = h('button', { class: 'btn ghost', type: 'button', onclick: () => {
+        if (!previewBox.hidden) {
+          previewBox.hidden = true;
+          return;
+        }
+        try {
+          const { text } = Core.pseudonymize(readEditorText(editor), vault);
+          previewBox.textContent = text.length > 3000 ? text.slice(0, 3000) + '\n…' : text;
+        } catch (err) {
+          previewBox.textContent = 'No se pudo generar la vista previa: ' + ((err && err.message) || 'error');
+        }
+        previewBox.hidden = false;
+      } }, icon('eye'), 'Vista previa');
+      const card = h('div', { class: 'card', role: 'dialog', 'aria-modal': 'true' },
+        head('Antes de enviar', 'Hemos encontrado datos sensibles', () => closeModal(editor)),
+        h('p', { class: 'lead' }, 'Se han detectado ' + findings.length + ' dato(s) en tu mensaje. Nada ha salido todavía de tu navegador.'),
+        h('ul', { class: 'list' }, items),
+        h('p', { class: 'hint' }, '«Proteger» los sustituye por marcadores y los restaura solo en tu pantalla cuando la IA responda.'),
+        previewBox,
+        h('div', { class: 'actions' }, previewBtn, h('span', { class: 'grow' }), cancel, unprotected, protect));
+      openOverlay(card, protect, editor);
+    } else {
+      const card = h('div', { class: 'card', role: 'alertdialog', 'aria-modal': 'true' },
+        head('Seguridad', 'Envío bloqueado', () => closeModal(editor), true),
+        h('p', { class: 'lead' }, 'PromptShield no ha podido comprobar el mensaje con garantías: ' + ((error && error.message) || 'error desconocido')),
+        h('p', { class: 'hint' }, 'Por defecto no se envía nada. Revisa el texto o decide enviarlo bajo tu responsabilidad.'),
+        h('div', { class: 'actions' }, h('span', { class: 'grow' }), unprotected, cancel));
+      openOverlay(card, cancel, editor);
+    }
+  }
+
+  // Selector de herramientas con búsqueda y filtro por categoría.
+  function showTools() {
+    let draft = '';
+    try {
+      const ed = findPromptEditor();
+      draft = ed ? readEditorText(ed).trim() : '';
+    } catch (_) {
+      draft = '';
+    }
+    let q = '';
+    let cat = 'Todas';
+    const cats = ['Todas'].concat(Array.from(new Set(TOOLS.map(catOf))));
+
+    const cards = TOOLS.map((t, i) => {
+      const b = h('button', { class: 'tcard', type: 'button', onclick: () => showTool(t, 0, draft) },
+        h('span', { class: 'tnum' }, String(i + 1).padStart(2, '0')),
+        h('strong', {}, t.name),
+        h('span', { class: 'tdesc' }, t.desc),
+        h('span', { class: 'tcat' }, catOf(t)));
+      b.style.animationDelay = Math.min(i * 18, 220) + 'ms';
+      return b;
+    });
+    const empty = h('div', { class: 'empty' }, 'Ninguna herramienta coincide con tu búsqueda.');
+    empty.hidden = true;
+    const apply = () => {
+      let n = 0;
+      cards.forEach((b, i) => {
+        const t = TOOLS[i];
+        const ok = (cat === 'Todas' || catOf(t) === cat) && (!q || (t.name + ' ' + t.desc).toLowerCase().includes(q));
+        b.hidden = !ok;
+        if (ok) n++;
+      });
+      empty.hidden = n > 0;
+    };
+    const search = h('input', { class: 'search', type: 'search', placeholder: 'Buscar herramienta…', 'aria-label': 'Buscar herramienta', oninput: (e) => {
+      q = e.target.value.trim().toLowerCase();
+      apply();
+    } });
+    const chips = cats.map((c) => {
+      const b = h('button', { class: 'chipbtn', type: 'button', 'aria-pressed': String(c === cat) }, c);
+      b.addEventListener('click', () => {
+        cat = c;
+        chips.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        apply();
+      });
+      return b;
+    });
+
+    const card = h('div', { class: 'card wide', role: 'dialog', 'aria-modal': 'true' },
+      head('Herramientas', '¿Qué necesitas hoy?', () => closeModal()),
+      h('p', { class: 'lead' }, 'Rellenas unos datos, se escribe el prompt en el chat y se envía tras la comprobación de datos sensibles.'),
+      h('div', { class: 'field' }, icon('search'), search),
+      h('div', { class: 'chips' }, chips),
+      h('div', { class: 'grid' }, cards, empty),
+      h('div', { class: 'cfoot' }, credit(), h('span', { class: 'hint' }, TOOLS.length + ' herramientas')));
+    openOverlay(card, search);
+  }
+
+  function showTool(tool, modeIdx, prefill) {
+    const spec = tool.modes ? tool.modes[modeIdx] : tool;
+    const areas = spec.fields.map((f, i) => {
+      const ta = h('textarea', { class: 'in', rows: f.rows || 4, placeholder: f.ph || '' });
+      if (i === 0 && prefill) ta.value = prefill;
+      return ta;
+    });
+    const fields = spec.fields.map((f, i) =>
+      h('label', { class: 'fld' }, h('span', { class: 'flabel' }, f.label, f.req ? h('i', {}, ' *') : null), areas[i]));
+    const modeSeg = tool.modes
+      ? seg(tool.modes.map((m, i) => [String(i), m.label]), String(modeIdx), (v) =>
+          showTool(tool, Number(v), areas[0] ? areas[0].value : ''))
+      : null;
+
+    const back = h('button', { class: 'btn ghost', type: 'button', onclick: () => showTools() }, icon('back'), 'Volver');
+    const go = h('button', { class: 'btn primary', type: 'button', onclick: () => {
+      const values = areas.map((a) => a.value);
+      const missing = spec.fields.findIndex((f, i) => f.req && !values[i].trim());
+      if (missing >= 0) {
+        toast('Falta: ' + spec.fields[missing].label, 'warn');
+        areas[missing].focus();
+        return;
+      }
+      const text = buildToolPrompt(spec, values);
+      closeModal();
+      runTool(text);
+    } }, icon('send'), 'Generar y enviar', h('kbd', {}, 'Ctrl ↵'));
+    areas.forEach((a) => a.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        go.click();
+      }
+    }));
+
+    const card = h('div', { class: 'card wide', role: 'dialog', 'aria-modal': 'true' },
+      head(catOf(tool), tool.name, () => closeModal()),
+      h('p', { class: 'lead' }, tool.desc),
+      modeSeg,
+      tool.intro ? h('div', { class: 'intro' }, tool.intro) : null,
+      fields,
+      h('div', { class: 'actions' }, back, h('span', { class: 'grow hint' }, 'Se comprueban datos sensibles antes de enviar. Nada se guarda.'), go));
+    openOverlay(card, areas[0]);
+  }
+
+  function showRules() {
+    const types = Object.keys(Core.TYPE_LABEL).filter((t) => t !== 'SECRETO');
+    const checks = types.map((t) => {
+      const c = h('input', { type: 'checkbox' });
+      c.checked = !settings.off.includes(t);
+      return { t, c };
+    });
+    const words = h('textarea', { class: 'in', rows: 5, placeholder: 'Un nombre, empresa o proyecto por línea' });
+    words.value = customTerms.join('\n');
+    const cancel = h('button', { class: 'btn ghost', type: 'button', onclick: () => closeModal() }, 'Cancelar');
+    const save = h('button', { class: 'btn primary', type: 'button', onclick: () => {
+      settings.off = checks.filter((x) => !x.c.checked).map((x) => x.t);
+      saveSettings();
+      Core.setDisabled(settings.off);
+      customTerms = words.value.split('\n').map((x) => x.trim()).filter(Boolean).slice(0, 200);
+      Core.setCustomTerms(customTerms);
+      closeModal();
+      toast('Reglas guardadas', 'ok');
+    } }, 'Guardar');
+    const card = h('div', { class: 'card', role: 'dialog', 'aria-modal': 'true' },
+      head('Ajustes', 'Reglas de protección', () => closeModal()),
+      h('p', { class: 'lead' }, 'Elige qué tipos de dato se detectan. Las claves y los secretos siempre se protegen.'),
+      h('div', { class: 'rules' }, checks.map((x) => h('label', { class: 'opt' }, x.c, Core.TYPE_LABEL[x.t]))),
+      h('label', { class: 'fld' }, h('span', { class: 'flabel' }, 'Palabras propias a proteger'), words),
+      h('p', { class: 'hint' }, 'Se buscan sin distinguir mayúsculas y solo se guardan en memoria: se pierden al recargar la página.'),
+      h('div', { class: 'actions' }, h('span', { class: 'grow' }), cancel, save));
+    openOverlay(card, words);
+  }
+
+  /* ---------- Arranque ---------- */
+
+  function init() {
+    mountUI();
+    window.addEventListener('keydown', onKeydown, true);
+    window.addEventListener('click', onClick, true);
+    window.addEventListener('submit', onSubmit, true);
+    startRestoreObserver();
+    // Si la SPA elimina nuestro nodo, se vuelve a montar.
+    setInterval(() => {
+      if (!host.isConnected) document.documentElement.append(host);
+    }, 3000);
+  }
+
+  try {
+    init();
+  } catch (err) {
+    console.error('[PromptShield] No se pudo iniciar:', err);
+  }
+})();
